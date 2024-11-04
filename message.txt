@@ -1,0 +1,204 @@
+#include "driver/sdmmc_host.h"
+#include "esp_err.h"
+#include "esp_jpg_decode.h" // Ensure this header exists and is correctly implemented
+#include "esp_log.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include <ctype.h>
+#include <float.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "esp_timer.h"
+#include <stdlib.h>
+#include <string.h>
+
+#define TAG "kicker_detection"
+#define MOUNT_POINT "/sdcard"
+
+typedef struct Image {
+    unsigned int width;
+    unsigned int height;
+    float *data;
+} Image;
+
+// Function to load a JPEG image
+esp_err_t loadJpegImage(const char *filename, Image *img) {
+    // Open the JPEG file
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        ESP_LOGE(TAG, "Failed to open JPEG file: %s", filename);
+        return ESP_FAIL;
+    }
+
+    // Decode JPEG image
+    esp_err_t err = esp_jpg_decode(file, &img->width, &img->height, NULL);
+    if (err != ESP_OK) {
+        fclose(file);
+        ESP_LOGE(TAG, "Failed to decode JPEG image: %s", filename);
+        return err;
+    }
+
+    // Allocate memory for image data
+    img->data = (float *)malloc(img->width * img->height * sizeof(float));
+    if (!img->data) {
+        fclose(file);
+        ESP_LOGE(TAG, "Failed to allocate memory for image data.");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Read the pixel data into img->data
+    fread(img->data, sizeof(float), img->width * img->height, file);
+    fclose(file);
+    return ESP_OK;
+}
+
+int countWhitePixels(const Image *img, int startX, int startY, int width, int height) {
+    int whitePixels = 0;
+    for (int y = startY; y < startY + height; ++y) {
+        for (int x = startX; x < startX + width; ++x) {
+            if (img->data[y * img->width + x] > 0.8) {
+                whitePixels++;
+            }
+        }
+    }
+    return whitePixels;
+}
+
+bool detect_kicker_by_white_pixels(Image *img, double threshold_percentage) {
+    int width = img->width;
+    int height = img->height;
+    int upperHeight = height / 2;
+    int totalPixels = width * upperHeight;
+    int whitePixels = countWhitePixels(img, 0, 0, width, upperHeight);
+    double whitePixelPercentage = (whitePixels / (double)totalPixels) * 100;
+    ESP_LOGI(TAG, "White Pixel Percentage in Upper Region: %.2f%%", whitePixelPercentage);
+    return (whitePixelPercentage > threshold_percentage);
+}
+
+float calculate_difference(const Image *test_roi, const Image *reference_roi) {
+    float difference = 0.0;
+    for (int y = 0; y < test_roi->height; ++y) {
+        for (int x = 0; x < test_roi->width; ++x) {
+            int index = y * test_roi->width + x;
+            float test_pixel = test_roi->data[index];
+            float reference_pixel = reference_roi->data[index];
+            difference += fabs(test_pixel - reference_pixel);
+        }
+    }
+    return difference;
+}
+
+int compare_image_rois(Image *test_roi, const char *reference_filenames[], int num_references) {
+    float min_difference = FLT_MAX;
+    int closest_match_index = -1;
+
+    for (int i = 0; i < num_references; i++) {
+        ESP_LOGI(TAG, "Loading reference image: %s", reference_filenames[i]);
+
+        Image *reference_image = malloc(sizeof(Image));
+        if (loadJpegImage(reference_filenames[i], reference_image) == ESP_OK) {
+            float difference = calculate_difference(test_roi, reference_image);
+            if (difference < min_difference) {
+                min_difference = difference;
+                closest_match_index = i;
+            }
+
+            free(reference_image->data);
+            free(reference_image);
+        } else {
+            ESP_LOGE(TAG, "Failed to load reference image: %s", reference_filenames[i]);
+        }
+    }
+    return closest_match_index;
+}
+
+void app_main(void) {
+    uint64_t total_running_time_start = esp_timer_get_time();
+    esp_err_t ret;
+
+    // SD card mount configuration
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+#ifdef CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
+        .format_if_mount_failed = true,
+#else
+        .format_if_mount_failed = false,
+#endif
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 1;
+#ifdef CONFIG_EXAMPLE_SDMMC_BUS_WIDTH_4
+    slot_config.width = 4;
+#else
+    slot_config.width = 1;
+#endif
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    // Mount SD card filesystem
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SD card filesystem.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "SD card mounted.");
+    
+    // Measure image loading time
+    uint64_t load_start_time = esp_timer_get_time();
+
+    // Enter file name.        
+    const char *image_path = MOUNT_POINT "/92x92/kkrV.jpg"; // Change to .jpg
+    Image *test_image = malloc(sizeof(Image));
+    
+    if (loadJpegImage(image_path, test_image) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to load test image.");
+        free(test_image);
+        return;
+    }
+
+    // Image loading time 
+    uint64_t load_end_time = esp_timer_get_time();
+    uint64_t loading_time_image = (load_end_time - load_start_time) / 1000;
+    printf("Image loading time: %lld ms\n", loading_time_image); // in ms
+
+    float threshold_percentage = 2.0;
+    
+    // Processing time start
+    uint64_t load_start_time_processing = esp_timer_get_time();
+    
+    if (detect_kicker_by_white_pixels(test_image, threshold_percentage)) {
+        ESP_LOGI(TAG, "Kicker detected!");
+
+        const char *reference_filenames[] = {
+            MOUNT_POINT "/rois/kkrIVc.jpg", MOUNT_POINT "/rois/kkrVc.jpg",
+            MOUNT_POINT "/rois/kkrVn.jpg", MOUNT_POINT "/rois/kkrIVn.jpg"
+        };
+
+        int closest_match = compare_image_rois(test_image, reference_filenames, 4);
+        const char *match_status = (closest_match == 0 || closest_match == 3) ? "invalid" : "valid";
+        ESP_LOGI(TAG, "Kicker position is %s, closest match to reference image: %s", match_status, reference_filenames[closest_match]);
+    } else {
+        ESP_LOGI(TAG, "Kicker not detected.");
+    }
+    
+    // Image processing time end
+    uint64_t load_end_time_processing = esp_timer_get_time();
+    uint64_t load_total_time_processing = (load_end_time_processing - load_start_time_processing) / 1000;
+    printf("Kicker Detection Processing Time: %lld ms\n", load_total_time_processing); // in ms
+
+    free(test_image->data);
+    free(test_image);
+    esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+    ESP_LOGI(TAG, "SD card unmounted.");
+    
+    // Total running time
+    uint64_t total_running_time_end = esp_timer_get_time();
+    uint64_t total_running_time = (total_running_time_end - total_running_time_start) / 1000;
+    printf("Total running time: %lld ms", total_running_time);
+}
