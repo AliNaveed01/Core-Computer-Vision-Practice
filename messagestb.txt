@@ -1,0 +1,200 @@
+#include <stdio.h>
+#include <string.h>
+#include <sys/unistd.h>
+#include <sys/stat.h>
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+#include "esp_vfs_fat.h"
+#include <ctype.h>
+#include <float.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "esp_timer.h"
+#include <stdlib.h>
+#include <string.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "stb_image_resize.h"
+
+static const char *TAG = "example";
+
+// Function to count white pixels
+int countWhitePixels(const uint8_t* img, int x_start, int y_start, int width, int height, int img_width, int num_channels) {
+    int whitePixels = 0;
+    for (int y = y_start; y < y_start + height; y++) {
+        for (int x = x_start; x < x_start + width; x++) {
+            int index = (y * img_width + x) * num_channels;
+            uint8_t intensity = 0;
+            for (int c = 0; c < num_channels; c++) {
+                intensity += img[index + c];
+            }
+            intensity /= num_channels;
+            if (intensity >= 204) { 
+                whitePixels++;
+            }
+        }
+    }
+    return whitePixels;
+}
+
+// Function to detect kicker by white pixel percentage
+bool detect_kicker_by_white_pixels(const uint8_t* img, int img_width, int img_height, int num_channels, double threshold_percentage) {
+    int upperHeight = img_height / 2;
+    int totalPixels = img_width * upperHeight;
+    int whitePixels = countWhitePixels(img, 0, 0, img_width, upperHeight, img_width, num_channels);
+    double whitePixelPercentage = (whitePixels / (double)totalPixels) * 100;
+    ESP_LOGI(TAG, "White Pixel Percentage in Upper Region: %.2f%%", whitePixelPercentage);
+    return (whitePixelPercentage > threshold_percentage);
+}
+
+// Function to calculate difference between two images
+float calculate_difference(const uint8_t *test_roi, const uint8_t *reference_roi, int width, int height) {
+    float difference = 0.0;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int index = y * width + x;
+            float test_pixel = test_roi[index];
+            float reference_pixel = reference_roi[index];
+            difference += fabs(test_pixel - reference_pixel);
+        }
+    }
+    return difference;
+}
+
+// Generic image resizing function
+uint8_t* resize_image(const uint8_t* input_image, int input_width, int input_height, int channels, int new_width, int new_height) {
+    uint8_t* resized_image = (uint8_t*)malloc(new_width * new_height * sizeof(uint8_t));
+    if (resized_image == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for resized image.");
+        return NULL;
+    }
+
+    if (!stbir_resize_uint8(input_image, input_width, input_height, 0, resized_image, new_width, new_height, 0, channels)) {
+        ESP_LOGE(TAG, "Failed to resize image.");
+        free(resized_image);
+        return NULL;
+    }
+
+    return resized_image;
+}
+
+// Function to compare image ROIs for orientation matching, with resizing of reference images
+int compare_image_rois(const uint8_t *test_image, int test_width, int test_height, const char *reference_filenames[], int num_references) {
+    float min_difference = FLT_MAX;
+    int closest_match_index = -1;
+
+    for (int i = 0; i < num_references; i++) {
+        ESP_LOGI(TAG, "Loading reference image: %s", reference_filenames[i]);
+
+        int ref_width, ref_height, ref_channels;
+        uint8_t *reference_image_data = stbi_load(reference_filenames[i], &ref_width, &ref_height, &ref_channels, 1);
+
+        if (reference_image_data != NULL) {
+            // Resize the reference image to match the test image dimensions (test_width x test_height)
+            uint8_t* resized_reference_image = resize_image(reference_image_data, ref_width, ref_height, 1, test_width, test_height);
+            stbi_image_free(reference_image_data); // Free original reference image data
+
+            if (resized_reference_image != NULL) {
+                // Calculate difference between test image and resized reference image
+                float difference = calculate_difference(test_image, resized_reference_image, test_width, test_height);
+                if (difference < min_difference) {
+                    min_difference = difference;
+                    closest_match_index = i;
+                }
+                free(resized_reference_image); // Free resized image data
+            } else {
+                ESP_LOGE(TAG, "Failed to resize reference image: %s", reference_filenames[i]);
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to load reference image: %s", reference_filenames[i]);
+        }
+    }
+    return closest_match_index;
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Initializing SPIFFS");
+    int64_t start_total_time = esp_timer_get_time();
+
+    esp_vfs_spiffs_conf_t conf = {
+      .base_path = "/spiffs",
+      .partition_label = NULL,
+      .max_files = 5,
+      .format_if_mount_failed = true
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        return;
+    }
+
+    const char* image_path = "/spiffs/images/3.jpg";
+
+    // Measure image loading time
+    int64_t start_load_time = esp_timer_get_time();
+    int width, height, channels;
+    uint8_t* image_data = stbi_load(image_path, &width, &height, &channels, 1);
+    int64_t end_load_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Image loading time: %lld ms", (end_load_time - start_load_time) / 1000);
+
+    if (image_data == NULL) {
+        ESP_LOGE(TAG, "Error in loading the image");
+        return;
+    }
+
+    // Measure image resizing time
+    int resized_width = 128;
+    int resized_height = 128;
+    int64_t start_resize_time = esp_timer_get_time();
+    uint8_t* resized_image_data = resize_image(image_data, width, height, channels, resized_width, resized_height);
+    int64_t end_resize_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Image resizing time: %lld ms", (end_resize_time - start_resize_time) / 1000);
+
+    if (resized_image_data == NULL) {
+        stbi_image_free(image_data);
+        return;
+    }
+
+    // Measure kicker detection time
+    float threshold_percentage = 1.5;
+    int64_t start_detection_time = esp_timer_get_time();
+    bool kicker_detected = detect_kicker_by_white_pixels(resized_image_data, resized_width, resized_height, 1, threshold_percentage);
+    int64_t end_detection_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Kicker detection time: %lld ms", (end_detection_time - start_detection_time) / 1000);
+
+    if (kicker_detected) {
+        ESP_LOGI(TAG, "Kicker detected in the image.");
+        const char *reference_filenames[] = {
+                "/spiffs/kkrIVc.jpg", "/spiffs/kkrVc.jpg", "/spiffs/kkrVb.jpg",
+                "/spiffs/kkrVn.jpg", "/spiffs/kkrIVn.jpg","/spiffs/kkrIVb.jpg" 
+        };
+
+        // Measure kicker orientation matching time
+        int64_t start_orientation_time = esp_timer_get_time();
+        int closest_match = compare_image_rois(resized_image_data, resized_width, resized_height, reference_filenames, 6);
+        int64_t end_orientation_time = esp_timer_get_time();
+        ESP_LOGI(TAG, "Kicker orientation matching time: %lld ms", (end_orientation_time - start_orientation_time) / 1000);
+
+        if (closest_match != -1) {
+            const char *match_status = (closest_match == 1 || closest_match == 2 || closest_match == 3) ? "valid" : "invalid";
+            ESP_LOGI(TAG, "Kicker position is %s, closest match to reference image: %s", match_status, reference_filenames[closest_match]);
+        } else {
+            ESP_LOGI(TAG, "No close match found for kicker orientation.");
+        }
+    } else {
+        ESP_LOGI(TAG, "No kicker detected in the image.");
+    }
+
+    // Measure and log total pipeline time
+    int64_t end_total_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Total pipeline time: %lld ms", (end_total_time - start_total_time) / 1000);
+
+    stbi_image_free(image_data);
+    free(resized_image_data);
+    esp_vfs_spiffs_unregister(conf.partition_label);
+    ESP_LOGI(TAG, "SPIFFS unmounted");
+}
